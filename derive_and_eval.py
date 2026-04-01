@@ -23,6 +23,7 @@ if "/home/tau/sdouka/codebase/experimental_grow" not in sys.path:
 
 from genotypes import Genotype, PRIMITIVES
 from model_search import Network
+from logger import Logger
 import utils
 from tools.datasets import known_datasets, get_transforms, get_num_classes
 
@@ -36,9 +37,20 @@ parser.add_argument('--gpu',      type=int, default=0)
 # sp=0 search model config — must match the run that produced weights.pt
 parser.add_argument('--channels', type=int, default=16)
 parser.add_argument('--layers',   type=int, default=5)
+parser.add_argument('--experiment_name', type=str, default='NAS')
+parser.add_argument('--no-logger', action='store_true', default=False)
+parser.add_argument('--logger_api', type=str, default='wandb', choices=['mlflow', 'wandb'])
+parser.add_argument('--logger_port', type=int, default=27027)
+parser.add_argument('--log_path', type=str, default=None)
+parser.add_argument('--search_epoch', type=int, default=0)
 args = parser.parse_args()
 
 torch.cuda.set_device(args.gpu)
+
+tracker = Logger(args.experiment_name, port=args.logger_port,
+                 api=args.logger_api, enabled=not args.no_logger)
+tracker.setup_tracking(file_path=args.log_path)
+tracker.start_run(group="P-DARTS")
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def derive_genotype(alphas_normal, alphas_reduce):
@@ -98,6 +110,8 @@ search_model = search_model.cuda()
 search_model.eval()
 
 print(f"Loaded search model  |  channels={args.channels}  layers={args.layers}")
+for key, value in vars(args).items():
+    tracker.log_parameter(key, str(value))
 
 # ── 2. derive genotype ────────────────────────────────────────────────────────
 alphas_n = search_model.alphas_normal.detach().cpu().numpy()
@@ -106,6 +120,7 @@ alphas_r = search_model.alphas_reduce.detach().cpu().numpy()
 genotype = derive_genotype(alphas_n, alphas_r)
 print("\nDerived genotype:")
 print(genotype)
+tracker.log_parameter('genotype', str(genotype))
 
 # ── 3. evaluate search model on test set ─────────────────────────────────────
 criterion_cuda = torch.nn.CrossEntropyLoss().cuda()
@@ -125,5 +140,7 @@ with torch.no_grad():
             print(f"test {step:03d}  loss={objs.avg:.4f}  acc={top1.avg:.2f}%")
 
 print(f"\nSearch-model test accuracy:  {top1.avg:.2f}%  (loss {objs.avg:.4f})")
+tracker.log_metrics({"training/test accuracy": top1.avg / 100., "training/test loss": objs.avg}, step=args.search_epoch, step_name="search epoch")
+tracker.end_run()
 print("\nTo train the eval model from scratch, add this genotype to genotypes.py")
 print("and run train_cifar.py with --arch <name>.")
