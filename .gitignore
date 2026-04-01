@@ -9,3 +9,9 @@ tmp/
 
 # Logs
 wandb/
+*.out
+
+# Visualization
+*.pdf
+normal
+reduction
