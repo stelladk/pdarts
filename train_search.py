@@ -18,6 +18,7 @@ from model_search import Network
 from model import NetworkCIFAR
 from genotypes import PRIMITIVES
 from genotypes import Genotype
+import genotypes as gt_module
 
 
 if "/home/sdouka/Documents/Projects/InriaGitlab/experimental_grow/" not in sys.path:
@@ -82,6 +83,10 @@ parser.add_argument('--eval_auxiliary_weight', type=float, default=0.4, help='ev
 parser.add_argument('--eval_drop_path_prob', type=float, default=0.3, help='eval: drop path probability')
 parser.add_argument('--eval_learning_rate', type=float, default=0.025, help='eval: init learning rate')
 parser.add_argument('--eval_batch_size', type=int, default=128, help='eval: batch size')
+parser.add_argument('--init_genotype', type=str, default=None,
+                    help='name of a genotype in genotypes.py to warm-start arch parameters '
+                         '(e.g. PDARTS, DARTS_V2). Switches remain fully open; only alphas '
+                         'are biased toward the given genotype at stage 0.')
 
 args = parser.parse_args()
 
@@ -97,6 +102,47 @@ logging.getLogger().addHandler(fh)
 
 _dataset_name = 'cifar100' if args.cifar100 else (args.dataset or 'cifar10')
 CIFAR_CLASSES = get_num_classes(_dataset_name)
+
+def warm_start_alphas(model, genotype, bias=5.0):
+    """Bias arch parameters toward the ops in genotype at the start of search.
+
+    For each edge present in the genotype, the corresponding alpha column is
+    set to `bias`; all other columns on that edge are zeroed.  Edges not
+    mentioned in the genotype are left at their random initialisation so the
+    search can still explore freely.
+
+    Args:
+        model: the search Network (after DataParallel wrapping).
+        genotype: a Genotype namedtuple.
+        bias: the value written to the favoured alpha column (default 5.0).
+    """
+    # Cumulative start index for each of the 4 intermediate nodes.
+    # Node i has (2+i) input edges; starts = [0, 2, 5, 9].
+    step_starts = [sum(2 + j for j in range(i)) for i in range(4)]
+
+    def _apply(alphas, gene, switches):
+        with torch.no_grad():
+            for pair_idx, (op_name, input_node) in enumerate(gene):
+                step = pair_idx // 2          # 2 ops retained per node
+                edge = step_starts[step] + input_node
+                enabled_ops = [j for j in range(len(PRIMITIVES)) if switches[edge][j]]
+                if not enabled_ops:
+                    continue
+                op_global_idx = PRIMITIVES.index(op_name)
+                if op_global_idx not in enabled_ops:
+                    logging.warning(
+                        'init_genotype: op "%s" not enabled on edge %d — skipping',
+                        op_name, edge)
+                    continue
+                col = enabled_ops.index(op_global_idx)
+                alphas.data[edge].zero_()
+                alphas.data[edge][col] = bias
+
+    # switches at stage-0 are all-True, so every op maps to a valid column
+    all_true = [[True] * len(PRIMITIVES) for _ in range(14)]
+    _apply(model.module.alphas_normal, genotype.normal, all_true)
+    _apply(model.module.alphas_reduce, genotype.reduce, all_true)
+
 
 def main():
     if not torch.cuda.is_available():
@@ -181,10 +227,26 @@ def main():
     eps_no_archs = [10, 10, 10]
     global_epoch = 0
     genotype = None
+
+    # Resolve init_genotype once before the stage loop
+    init_genotype = None
+    if args.init_genotype is not None:
+        if not hasattr(gt_module, args.init_genotype):
+            logging.error('init_genotype "%s" not found in genotypes.py', args.init_genotype)
+            sys.exit(1)
+        init_genotype = getattr(gt_module, args.init_genotype)
+        logging.info('Warm-starting arch parameters from genotype: %s', args.init_genotype)
+
     for sp in range(len(num_to_keep)):
         model = Network(args.init_channels + int(add_width[sp]), CIFAR_CLASSES, args.layers + int(add_layers[sp]), criterion, switches_normal=switches_normal, switches_reduce=switches_reduce, p=float(drop_rate[sp]), C_in=input_channels)
         model = nn.DataParallel(model)
         model = model.cuda()
+        if sp == 0 and init_genotype is not None:
+            warm_start_alphas(model, init_genotype)
+
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        tracker.log_metric('training/nb of parameters', n_params, step=global_epoch, step_name='search epoch')
+
         network_params = []
         for k, v in model.named_parameters():
             if not (k.endswith('alphas_normal') or k.endswith('alphas_reduce')):
