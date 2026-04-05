@@ -76,28 +76,64 @@ tracker.start_run(group="P-DARTS")
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def parse_log(log_path):
-    """Parse save directory and last completed stage from a training log.
+    """Parse save directory, last completed stage, and per-stage model config
+    from a training log.
 
     weights.pt is saved once per stage before the "Dropping" print, so
     N "Dropping" lines means the last weights.pt is from stage N-1.
 
-    Returns (save_dir: str, stage: int).
+    Applies the same add_width/add_layers fallback logic as train_search.py:
+      len != 3  →  add_width=[0,0,0], add_layers=[0,6,12]
+
+    Returns (save_dir, stage, channels, layers) for the last saved stage.
     """
     save_dir = None
+    init_channels, base_layers = 16, 5
+    add_width_raw, add_layers_raw = ['0'], ['0']
     dropping_count = 0
+
     with open(log_path) as f:
         for line in f:
             if save_dir is None:
-                m = re.search(r"save='([^']+)'", line)
+                m = re.search(r"args = Namespace\((.+)\)", line)
                 if m:
-                    save_dir = m.group(1)
+                    ns = m.group(1)
+                    for key, var in [('init_channels', 'init_channels'),
+                                     ('layers',        'base_layers')]:
+                        mv = re.search(rf'\b{key}=(\d+)', ns)
+                        if mv:
+                            locals()[var]   # just check it exists
+                            if key == 'init_channels':
+                                init_channels = int(mv.group(1))
+                            else:
+                                base_layers = int(mv.group(1))
+                    for key, var in [('add_width', 'add_width_raw'),
+                                     ('add_layers', 'add_layers_raw')]:
+                        mv = re.search(rf"{key}=(\[[^\]]*\])", ns)
+                        if mv:
+                            if key == 'add_width':
+                                add_width_raw = ast.literal_eval(mv.group(1))
+                            else:
+                                add_layers_raw = ast.literal_eval(mv.group(1))
+                    mv = re.search(r"save='([^']+)'", ns)
+                    if mv:
+                        save_dir = mv.group(1)
             if '------Dropping' in line:
                 dropping_count += 1
+
     if save_dir is None:
         raise ValueError(f"Could not find save= in log {log_path}")
     if dropping_count == 0:
         raise ValueError(f"No completed stage found in log {log_path}")
-    return save_dir, dropping_count - 1
+
+    # same fallback as train_search.py
+    add_width  = [int(x) for x in add_width_raw]  if len(add_width_raw)  == 3 else [0, 0, 0]
+    add_layers = [int(x) for x in add_layers_raw] if len(add_layers_raw) == 3 else [0, 6, 12]
+
+    stage    = dropping_count - 1
+    channels = init_channels + add_width[stage]
+    layers   = base_layers   + add_layers[stage]
+    return save_dir, stage, channels, layers
 
 
 def parse_switches_from_log(log_path, occurrence):
@@ -161,14 +197,17 @@ def derive_genotype(alphas_normal, alphas_reduce, switches_normal, switches_redu
     )
 
 
-# ── resolve weights path and stage from log ───────────────────────────────────
-log_save_dir, log_stage = parse_log(args.log)
-stage   = args.stage   if args.stage   is not None else log_stage
-weights = args.weights if args.weights is not None else f'{log_save_dir}/weights.pt'
+# ── resolve weights path, stage, and model config from log ────────────────────
+log_save_dir, log_stage, log_channels, log_layers = parse_log(args.log)
+stage    = args.stage   if args.stage   is not None else log_stage
+weights  = args.weights if args.weights is not None else f'{log_save_dir}/weights.pt'
+channels = args.channels if args.channels != 16 else log_channels  # 16 = argparse default
+layers   = args.layers   if args.layers   != 5  else log_layers    # 5  = argparse default
 print(f'Log: {args.log}')
 print(f'  save dir : {log_save_dir}')
-print(f'  stage    : {stage}  {"(from log)" if args.stage is None else "(overridden)"}')
+print(f'  stage    : {stage}   {"(from log)" if args.stage is None else "(overridden)"}')
 print(f'  weights  : {weights}  {"(from log)" if args.weights is None else "(overridden)"}')
+print(f'  channels : {channels}  layers: {layers}  {"(from log)" if args.channels == 16 and args.layers == 5 else "(overridden)"}')
 
 # ── resolve switches ──────────────────────────────────────────────────────────
 if stage == 0:
@@ -198,7 +237,7 @@ input_channels = test_data[0][0].shape[0]
 
 criterion   = torch.nn.CrossEntropyLoss()
 search_model = Network(
-    args.channels, num_classes, args.layers, criterion,
+    channels, num_classes, layers, criterion,
     switches_normal=switches_normal,
     switches_reduce=copy.deepcopy(switches_reduce),
     p=0.0, C_in=input_channels,
@@ -229,7 +268,7 @@ search_model.load_state_dict(state)
 search_model = search_model.cuda()
 search_model.eval()
 
-print(f"Loaded search model  |  channels={args.channels}  layers={args.layers}  "
+print(f"Loaded search model  |  channels={channels}  layers={layers}  "
       f"stage={args.stage}  ops_per_edge={search_model.switch_on}")
 for key, value in vars(args).items():
     tracker.log_parameter(key, str(value))
