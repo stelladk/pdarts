@@ -1,14 +1,31 @@
 """
-Derive the genotype from a saved search checkpoint (weights.pt from sp=0)
-and evaluate the search model on the test set.
+Derive the genotype from a saved search checkpoint and evaluate the search
+model on the test set.
+
+weights.pt is saved at the END of each search stage (overwriting the previous
+one), so the switches active in that stage must be used to reconstruct the
+model.
+
+Pass --log to a slurm/training log and both the weights.pt path and the stage
+are derived automatically:
+  - save dir  →  parsed from the "args = Namespace(..., save='...', ...)" line
+  - stage     →  number of "Dropping" lines completed (each stage saves then drops)
+
+--weights and --stage can still be passed explicitly to override the log values.
 
 Usage:
-    python derive_and_eval.py \
-        --weights /scratch/sdouka/tmp/pdarts/checkpoints/search-try-20260331-125718/weights.pt \
-        --data    /scratch/sdouka/data
+    # fully automatic from log:
+    python derive_and_eval.py --log slurm-budget-pdarts_multnist-58330_1.out \\
+        --search_epoch 46
+
+    # override weights path:
+    python derive_and_eval.py --log slurm-budget-pdarts_multnist-58330_1.out \\
+        --weights /other/path/weights.pt --search_epoch 46
 """
 
 import sys
+import re
+import ast
 import copy
 import argparse
 import numpy as np
@@ -29,12 +46,17 @@ from tools.datasets import known_datasets, get_transforms, get_num_classes
 
 # ── args ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
-parser.add_argument('--weights',  required=True, help='path to weights.pt')
-parser.add_argument('--data',     required=True, help='dataset root')
+parser.add_argument('--log',      required=True, help='path to the slurm/training log file')
+parser.add_argument('--data',     help='dataset root')
+parser.add_argument('--weights',  default=None,
+                    help='path to weights.pt; derived from --log if omitted')
+parser.add_argument('--stage',    type=int, default=None,
+                    help='which search stage produced weights.pt (0, 1, or 2); '
+                         'derived from --log if omitted')
 parser.add_argument('--dataset',  default='multnist')
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--gpu',      type=int, default=0)
-# sp=0 search model config — must match the run that produced weights.pt
+# search model config - must match the run that produced weights.pt
 parser.add_argument('--channels', type=int, default=16)
 parser.add_argument('--layers',   type=int, default=5)
 parser.add_argument('--experiment_name', type=str, default='NAS')
@@ -53,32 +75,114 @@ tracker.setup_tracking(file_path=args.log_path)
 tracker.start_run(group="P-DARTS")
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-def derive_genotype(alphas_normal, alphas_reduce):
-    """DARTS-style top-2-edges-per-node derivation, excluding 'none'."""
-    NONE_IDX = 0  # PRIMITIVES[0] == 'none'
+def parse_log(log_path):
+    """Parse save directory and last completed stage from a training log.
 
-    def _parse(alphas):
+    weights.pt is saved once per stage before the "Dropping" print, so
+    N "Dropping" lines means the last weights.pt is from stage N-1.
+
+    Returns (save_dir: str, stage: int).
+    """
+    save_dir = None
+    dropping_count = 0
+    with open(log_path) as f:
+        for line in f:
+            if save_dir is None:
+                m = re.search(r"save='([^']+)'", line)
+                if m:
+                    save_dir = m.group(1)
+            if '------Dropping' in line:
+                dropping_count += 1
+    if save_dir is None:
+        raise ValueError(f"Could not find save= in log {log_path}")
+    if dropping_count == 0:
+        raise ValueError(f"No completed stage found in log {log_path}")
+    return save_dir, dropping_count - 1
+
+
+def parse_switches_from_log(log_path, occurrence):
+    """Return (switches_normal, switches_reduce) for the given occurrence index
+    (0-based) of the 'switches_normal = ...' / 'switches_reduce = ...' pairs
+    logged after each drop step in train_search.py.
+
+    occurrence=0 → after stage-0 dropping  → used in the stage-1 model
+    occurrence=1 → after stage-1 dropping  → used in the stage-2 model
+    """
+    normals, reduces = [], []
+    with open(log_path) as f:
+        for line in f:
+            m = re.search(r'switches_normal = (\[.*\])', line)
+            if m:
+                normals.append(ast.literal_eval(m.group(1)))
+            m = re.search(r'switches_reduce = (\[.*\])', line)
+            if m:
+                reduces.append(ast.literal_eval(m.group(1)))
+
+    if occurrence > len(normals) - 1:
+        raise ValueError(
+            f'Log contains {len(normals)} switches_normal occurrence(s) '
+            f'but --stage {occurrence + 1} requires occurrence index {occurrence}. '
+            f'The run may not have completed that stage.'
+        )
+    return normals[occurrence], reduces[occurrence]
+
+
+def derive_genotype(alphas_normal, alphas_reduce, switches_normal, switches_reduce):
+    """DARTS-style top-2-edges-per-node derivation, excluding 'none'.
+
+    switches_normal/reduce map each alpha column back to the correct primitive:
+    for edge i, the j-th column of alphas corresponds to the j-th True entry
+    in switches[i].
+    """
+    def _parse(alphas, switches):
         probs = F.softmax(torch.tensor(alphas), dim=-1).numpy()
         gene, n, start = [], 2, 0
         for _ in range(4):          # 4 intermediate nodes
             end = start + n
             candidates = []
             for edge in range(start, end):
+                active_ops = [j for j in range(len(PRIMITIVES)) if switches[edge][j]]
                 p = probs[edge].copy()
-                p[NONE_IDX] = 0.0   # ignore 'none'
-                best_op = int(np.argmax(p))
-                candidates.append((p[best_op], best_op, edge - start))
+                # zero out 'none' (PRIMITIVES[0]) if it is still active
+                if 0 in active_ops:
+                    p[active_ops.index(0)] = 0.0
+                best_col = int(np.argmax(p))
+                best_prim_idx = active_ops[best_col]
+                candidates.append((p[best_col], best_prim_idx, edge - start))
             candidates.sort(reverse=True)
-            for _, op_idx, input_node in candidates[:2]:
-                gene.append((PRIMITIVES[op_idx], input_node))
+            for _, prim_idx, input_node in candidates[:2]:
+                gene.append((PRIMITIVES[prim_idx], input_node))
             start, n = end, n + 1
         return gene
 
     return Genotype(
-        normal=_parse(alphas_normal), normal_concat=range(2, 6),
-        reduce=_parse(alphas_reduce), reduce_concat=range(2, 6),
+        normal=_parse(alphas_normal, switches_normal), normal_concat=range(2, 6),
+        reduce=_parse(alphas_reduce, switches_reduce), reduce_concat=range(2, 6),
     )
 
+
+# ── resolve weights path and stage from log ───────────────────────────────────
+log_save_dir, log_stage = parse_log(args.log)
+stage   = args.stage   if args.stage   is not None else log_stage
+weights = args.weights if args.weights is not None else f'{log_save_dir}/weights.pt'
+print(f'Log: {args.log}')
+print(f'  save dir : {log_save_dir}')
+print(f'  stage    : {stage}  {"(from log)" if args.stage is None else "(overridden)"}')
+print(f'  weights  : {weights}  {"(from log)" if args.weights is None else "(overridden)"}')
+
+# ── resolve switches ──────────────────────────────────────────────────────────
+if stage == 0:
+    switches_normal = [[True] * len(PRIMITIVES) for _ in range(14)]
+    switches_reduce = [[True] * len(PRIMITIVES) for _ in range(14)]
+else:
+    # occurrence index = stage - 1  (stage 1 uses the 1st logged switches, etc.)
+    switches_normal, switches_reduce = parse_switches_from_log(args.log, stage - 1)
+    print(f'  switches_normal[0] active ops: '
+          f'{[PRIMITIVES[j] for j in range(len(PRIMITIVES)) if switches_normal[0][j]]}')
+    print(f'  switches_reduce[0] active ops: '
+          f'{[PRIMITIVES[j] for j in range(len(PRIMITIVES)) if switches_reduce[0][j]]}')
+
+# ── build search model ─────────────────────────────────────────────────────────
 base_transforms, _ = get_transforms(args.dataset, [])
 test_transform = transforms.Compose(base_transforms)
 dataset_cls    = known_datasets[args.dataset]
@@ -89,27 +193,44 @@ test_queue     = torch.utils.data.DataLoader(
     shuffle=False, pin_memory=False, num_workers=2,
 )
 
-num_classes   = get_num_classes(args.dataset)
-input_channels = test_data[0][0].shape[0]   # inferred from dataset; multnist = 3
+num_classes    = get_num_classes(args.dataset)
+input_channels = test_data[0][0].shape[0]
 
-criterion      = torch.nn.CrossEntropyLoss()
-switches_true  = [[True] * len(PRIMITIVES) for _ in range(14)]
-search_model   = Network(
+criterion   = torch.nn.CrossEntropyLoss()
+search_model = Network(
     args.channels, num_classes, args.layers, criterion,
-    switches_normal=switches_true,
-    switches_reduce=copy.deepcopy(switches_true),
+    switches_normal=switches_normal,
+    switches_reduce=copy.deepcopy(switches_reduce),
     p=0.0, C_in=input_channels,
 )
 
 # ── 1. load search model weights ──────────────────────────────────────────────
-state = torch.load(args.weights, map_location='cpu')
+state = torch.load(weights, map_location='cpu')
 # strip DataParallel 'module.' prefix if present
 state = {k.replace('module.', ''): v for k, v in state.items()}
+
+# diagnose shape mismatches before they crash load_state_dict
+model_state = search_model.state_dict()
+mismatches = [
+    (k, state[k].shape, model_state[k].shape)
+    for k in state if k in model_state and state[k].shape != model_state[k].shape
+]
+if mismatches:
+    print("Shape mismatches between checkpoint and model:")
+    for k, ckpt_shape, model_shape in mismatches:
+        print(f"  {k}: checkpoint {ckpt_shape}  vs  model {model_shape}")
+    raise RuntimeError(
+        "Cannot load checkpoint. "
+        "Check --channels / --layers match the run that produced weights.pt, "
+        "and that the --stage / --log switches are correct."
+    )
+
 search_model.load_state_dict(state)
 search_model = search_model.cuda()
 search_model.eval()
 
-print(f"Loaded search model  |  channels={args.channels}  layers={args.layers}")
+print(f"Loaded search model  |  channels={args.channels}  layers={args.layers}  "
+      f"stage={args.stage}  ops_per_edge={search_model.switch_on}")
 for key, value in vars(args).items():
     tracker.log_parameter(key, str(value))
 
@@ -117,7 +238,7 @@ for key, value in vars(args).items():
 alphas_n = search_model.alphas_normal.detach().cpu().numpy()
 alphas_r = search_model.alphas_reduce.detach().cpu().numpy()
 
-genotype = derive_genotype(alphas_n, alphas_r)
+genotype = derive_genotype(alphas_n, alphas_r, switches_normal, switches_reduce)
 print("\nDerived genotype:")
 print(genotype)
 tracker.log_parameter('genotype', str(genotype))
@@ -130,7 +251,7 @@ objs = utils.AvgrageMeter()
 with torch.no_grad():
     for step, (inputs, targets) in enumerate(test_queue):
         inputs, targets = inputs.cuda(), targets.cuda()
-        logits = search_model(inputs)          # search model returns logits directly
+        logits = search_model(inputs)
         loss   = criterion_cuda(logits, targets)
         prec1, _ = utils.accuracy(logits, targets, topk=(1, 5))
         n = inputs.size(0)
