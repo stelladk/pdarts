@@ -47,7 +47,7 @@ from tools.datasets import known_datasets, get_transforms, get_num_classes
 # ── args ──────────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument('--log',      required=True, help='path to the slurm/training log file')
-parser.add_argument('--data',     help='dataset root')
+parser.add_argument('--data',     help='dataset root', default="/scratch/sdouka/data")
 parser.add_argument('--weights',  default=None,
                     help='path to weights.pt; derived from --log if omitted')
 parser.add_argument('--stage',    type=int, default=None,
@@ -59,7 +59,7 @@ parser.add_argument('--gpu',      type=int, default=0)
 # search model config - must match the run that produced weights.pt
 parser.add_argument('--channels', type=int, default=16)
 parser.add_argument('--layers',   type=int, default=5)
-parser.add_argument('--experiment_name', type=str, default='NAS')
+parser.add_argument('--experiment_name', type=str, default='Budget')
 parser.add_argument('--no-logger', action='store_true', default=False)
 parser.add_argument('--logger_api', type=str, default='wandb', choices=['mlflow', 'wandb'])
 parser.add_argument('--logger_port', type=int, default=27027)
@@ -301,6 +301,10 @@ with torch.no_grad():
 
 print(f"\nSearch-model test accuracy:  {top1.avg:.2f}%  (loss {objs.avg:.4f})")
 tracker.log_metrics({"training/test accuracy": top1.avg / 100., "training/test loss": objs.avg}, step=args.search_epoch, step_name="search epoch")
+
+n_params = sum(p.numel() for p in search_model.parameters() if p.requires_grad)
+tracker.log_metric('training/nb of parameters', n_params, step=args.search_epoch, step_name="search epoch")
+
 tracker.end_run()
 print("\nTo train the eval model from scratch, add this genotype to genotypes.py")
 print("and run train_cifar.py with --arch <name>.")

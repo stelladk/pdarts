@@ -51,7 +51,7 @@ parser.add_argument('--grad_clip', type=float, default=5, help='gradient clippin
 parser.add_argument('--train_portion', type=float, default=0.5, help='portion of training data')
 parser.add_argument('--arch_learning_rate', type=float, default=6e-4, help='learning rate for arch encoding')
 parser.add_argument('--arch_weight_decay', type=float, default=1e-3, help='weight decay for arch encoding')
-parser.add_argument('--data', type=str, default='../data', help='dataset root directory')
+parser.add_argument('--data', type=str, default='/scratch/sdouka/data', help='dataset root directory')
 parser.add_argument('--note', type=str, default='try', help='note for this run')
 parser.add_argument('--dropout_rate', action='append', default=[], help='dropout rate of skip connect')
 parser.add_argument('--add_width', action='append', default=['0'], help='add channels')
@@ -183,6 +183,20 @@ def main():
         test_data = dataset_cls(root=args.data, train=False,
                                 download=True, transform=valid_transform)
 
+    # infer input channels from the dataset
+    input_channels = train_data[0][0].shape[0]
+    logging.info("input channels = %d", input_channels)
+
+    # build Network
+    criterion = nn.CrossEntropyLoss()
+    criterion = criterion.cuda()
+    
+    genotype = None
+    if genotype is not None:
+        run_evaluation(genotype, train_data, test_data, criterion, tracker, args, input_channels)
+        tracker.end_run()
+        return
+
     num_train = len(train_data)
     indices = list(range(num_train))
     split = int(np.floor(args.train_portion * num_train))
@@ -196,14 +210,7 @@ def main():
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
         pin_memory=True, num_workers=args.workers)
-
-    # infer input channels from the dataset
-    input_channels = train_data[0][0].shape[0]
-    logging.info("input channels = %d", input_channels)
-
-    # build Network
-    criterion = nn.CrossEntropyLoss()
-    criterion = criterion.cuda()
+    
     switches = []
     for i in range(14):
         switches.append([True for j in range(len(PRIMITIVES))])
@@ -553,6 +560,7 @@ def run_evaluation(genotype, train_data, test_data, criterion, tracker, args, in
     n_params_mb = utils.count_parameters_in_MB(eval_model)
     n_params = sum(p.numel() for p in eval_model.parameters() if p.requires_grad)
     logging.info('Eval model param size = %.4fMB (%d params)', n_params_mb, n_params)
+    tracker.log_metric('training/nb of parameters', n_params, step=0, step_name='epoch')
 
     # Full training set — no train/valid split for the evaluation phase
     eval_train_queue = torch.utils.data.DataLoader(
@@ -601,8 +609,7 @@ def run_evaluation(genotype, train_data, test_data, criterion, tracker, args, in
     # Log final trained evaluation model
     final_params = sum(p.numel() for p in eval_model.parameters() if p.requires_grad)
     logging.info('Final eval model param count = %d', final_params)
-    tracker.log_metric('training/nb of parameters', final_params,
-                       step=0, step_name='epoch')
+
     tracker.log_pytorch_model(
         model=eval_model,
         name=f"DARTS_{_dataset_name}",
