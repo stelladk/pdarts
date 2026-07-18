@@ -210,7 +210,11 @@ def main():
         train_data, batch_size=args.batch_size,
         sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[split:num_train]),
         pin_memory=True, num_workers=args.workers)
-    
+
+    test_queue = torch.utils.data.DataLoader(
+        test_data, batch_size=args.batch_size,
+        shuffle=False, pin_memory=True, num_workers=args.workers)
+
     switches = []
     for i in range(14):
         switches.append([True for j in range(len(PRIMITIVES))])
@@ -290,9 +294,12 @@ def main():
             logging.info('Epoch time: %ds', epoch_duration)
             valid_acc, valid_obj = infer(valid_queue, model, criterion)
             logging.info('Valid_acc %.4f Valid_loss %e', valid_acc / 100., valid_obj)
+            test_acc, test_obj = infer(test_queue, model, criterion)
+            logging.info('Test_acc %.4f Test_loss %e', test_acc / 100., test_obj)
             tracker.log_metrics({
                 'search/train accuracy': train_acc / 100., 'search/train loss': train_obj,
                 'search/val accuracy': valid_acc / 100., 'search/val loss': valid_obj,
+                'search/test accuracy': test_acc / 100., 'search/test loss': test_obj,
             }, step=global_epoch, step_name='search epoch')
             global_epoch += 1
         utils.save(model, os.path.join(args.save, 'weights.pt'))
