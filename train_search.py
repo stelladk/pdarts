@@ -66,6 +66,8 @@ parser.add_argument('--no-augment', action='store_true', default=False,
                     help='disable data augmentation')
 parser.add_argument('--experiment_name', type=str, default='NAS',
                     help='experiment name for the logger')
+parser.add_argument('--run_name', type=str, default=None,
+                    help='name for the wandb/mlflow run (defaults to an auto-generated name)')
 parser.add_argument('--no-logger', action='store_true', default=False,
                     help='disable experiment logger')
 parser.add_argument('--logger_api', type=str, default='wandb',
@@ -218,9 +220,9 @@ def main():
     tracker = Logger(args.experiment_name, port=args.logger_port,
                      api=args.logger_api, enabled=not args.no_logger)
     tracker.setup_tracking(file_path=args.log_path)
-    tracker.start_run(group="P-DARTS")
+    tracker.start_run(group="P-DARTS", run_name=args.run_name)
     for key, value in vars(args).items():
-        if key in ("no_logger", "api", "exp_name", "port", "log_path", "tmpdir"):
+        if key in ("no_logger", "api", "exp_name", "run_name", "port", "log_path", "tmpdir"):
                 continue
         tracker.log_parameter(key, str(value))
     #  prepare dataset
