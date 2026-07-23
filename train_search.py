@@ -89,17 +89,19 @@ parser.add_argument('--init_genotype', type=str, default=None,
                          '(e.g. PDARTS, DARTS_V2). Switches remain fully open; only alphas '
                          'are biased toward the given genotype at stage 0.')
 parser.add_argument('--resume', type=str, default=None,
-                    help='path to a checkpoint.pt (search or eval phase) to resume an interrupted '
-                         'run from; continues in that checkpoint\'s experiment directory and log '
-                         'file. The checkpoint records which phase it belongs to, so this works '
-                         'whether the run was interrupted during search or during the post-search '
-                         'evaluation training.')
+                    help='path to a checkpoint.pt (search or eval phase), or to a run directory '
+                         '(e.g. .../search-<note>-<timestamp>/) containing one, to resume an '
+                         'interrupted run from; continues in that checkpoint\'s experiment '
+                         'directory and log file. The checkpoint records which phase it belongs '
+                         'to, so this works whether the run was interrupted during search or '
+                         'during the post-search evaluation training.')
 
 args = parser.parse_args()
 
 if args.resume is not None:
     # Continue in the same experiment directory so logs and the checkpoint stay together.
-    args.save = os.path.dirname(os.path.abspath(args.resume))
+    resume_abspath = os.path.abspath(args.resume)
+    args.save = resume_abspath if os.path.isdir(resume_abspath) else os.path.dirname(resume_abspath)
     utils.create_exp_dir(args.save)
 else:
     # Millisecond precision avoids two runs launched in the same second colliding on
@@ -286,9 +288,20 @@ def main():
 
     resume_ckpt = None
     if args.resume is not None:
-        resume_ckpt = torch.load(args.resume, map_location='cuda')
+        resume_path = args.resume
+        if os.path.isdir(resume_path):
+            # Accept a run directory and pick whichever checkpoint is present,
+            # preferring the later eval-phase one.
+            candidates = [os.path.join(resume_path, 'eval_checkpoint.pt'),
+                          os.path.join(resume_path, 'checkpoint.pt')]
+            found = [c for c in candidates if os.path.isfile(c)]
+            if not found:
+                raise FileNotFoundError(
+                    'No checkpoint.pt or eval_checkpoint.pt found in resume directory: {}'.format(resume_path))
+            resume_path = found[0]
+        resume_ckpt = torch.load(resume_path, map_location='cuda')
         logging.info('Resuming from %s (phase=%s, epoch=%d)',
-                     args.resume, resume_ckpt['phase'], resume_ckpt['epoch'])
+                     resume_path, resume_ckpt['phase'], resume_ckpt['epoch'])
 
     # build Network
     criterion = nn.CrossEntropyLoss()
