@@ -301,7 +301,11 @@ def main():
                 raise FileNotFoundError(
                     'No checkpoint.pt or eval_checkpoint.pt found in resume directory: {}'.format(resume_path))
             resume_path = found[0]
-        resume_ckpt = torch.load(resume_path, map_location='cuda')
+        # weights_only=False: eval checkpoints store the derived Genotype
+        # (a namedtuple holding range objects), which the restricted unpickler
+        # torch>=2.6 defaults to rejects. These checkpoints are written by this
+        # script, so unpickling them is trusted.
+        resume_ckpt = torch.load(resume_path, map_location='cuda', weights_only=False)
         logging.info('Resuming from %s (phase=%s, epoch=%d)',
                      resume_path, resume_ckpt['phase'], resume_ckpt['epoch'])
 
