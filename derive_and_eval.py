@@ -60,6 +60,8 @@ parser.add_argument('--gpu',      type=int, default=0)
 parser.add_argument('--channels', type=int, default=16)
 parser.add_argument('--layers',   type=int, default=5)
 parser.add_argument('--experiment_name', type=str, default='Budget')
+parser.add_argument('--run_name', type=str, default=None,
+                    help='name for the wandb/mlflow run (defaults to an auto-generated name)')
 parser.add_argument('--no-logger', action='store_true', default=False)
 parser.add_argument('--logger_api', type=str, default='wandb', choices=['mlflow', 'wandb'])
 parser.add_argument('--logger_port', type=int, default=27027)
@@ -72,7 +74,7 @@ torch.cuda.set_device(args.gpu)
 tracker = Logger(args.experiment_name, port=args.logger_port,
                  api=args.logger_api, enabled=not args.no_logger)
 tracker.setup_tracking(file_path=args.log_path)
-tracker.start_run(group="P-DARTS")
+tracker.start_run(group="P-DARTS", run_name=args.run_name)
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def parse_log(log_path):
